@@ -1,0 +1,778 @@
+{
+  "info": {
+    "_postman_id": "b7e4c1a2-9f30-4d6e-8a11-0b00bd00d001",
+    "name": "BookBuddy Agent API",
+    "description": "HTTP API for the sample FastAPI + LangChain book-discovery agent.\n\nStart the backend first:\n\n```\nuvicorn backend.main:app --reload --port 8000\n```\n\nThen set the collection variable `baseUrl` if you are not on `http://localhost:8000`.\n\n## How a conversation works\n\nEvery conversation is one `session_id`. Send the **same** id on `/chat`, `/chat/stream`, `/approve`, and `/reject`. The Tests script on **Send a message** saves `session_id` and, when the agent pauses, `action_id`, into collection variables. Later requests use `{{session_id}}` and `{{action_id}}`.\n\nSuggested order:\n\n1. **Health** — confirm the server is up and which checkpoint backend is active.\n2. **Send a message** — `Find sci-fi classics`. Expect `status: completed`.\n3. **Send a message** again — `Tell me more about number 2`. Same `session_id`, so the agent still has the list.\n4. **Send a message** again — `I want to read number 1`. Expect `status: awaiting_approval`. The URL is not included yet. `action_id` is saved automatically.\n5. **Approve** — the agent resumes and `handoff_url` is the Open Library link. Or **Reject** — no URL.\n6. **Get session** — the transcript. **Delete session** — wipe it (next call is 404).\n\n`GET /books/{work_key}` does not use the agent or a session. It calls Open Library directly.\n\n## Response shape for /chat, /approve, /reject\n\n```json\n{\n  \"session_id\": \"postman-demo\",\n  \"status\": \"completed\",\n  \"response\": \"I found these books...\",\n  \"pending_action\": null,\n  \"handoff_url\": null\n}\n```\n\n`status` is `completed` or `awaiting_approval`.\n\nWhen `awaiting_approval`, `pending_action` looks like:\n\n```json\n{\n  \"action_id\": \"copy-this-into-approve\",\n  \"tool_name\": \"proceed_to_borrow\",\n  \"arguments\": {\"work_key\": \"OL893414W\", \"title\": \"Dune\", \"author\": \"Frank Herbert\"},\n  \"description\": \"You selected:\\n  Title:  Dune\\n...\"\n}\n```\n\n`handoff_url` is set only after a successful **Approve**. It stays null on Reject and while approval is pending.\n\n## Errors\n\nFailures are JSON `{\"detail\": \"one friendly sentence\"}`. You should never see a Python traceback.\n\n| Code | When |\n|------|------|\n| 400 | `GET /books/{work_key}` with a key that is not an Open Library work id |\n| 404 | Unknown session, or unknown book id |\n| 409 | Approve/Reject when nothing is pending, or the `action_id` is stale |\n| 422 | Body failed validation (empty `message`, missing `action_id`, …) |\n| 502 | Open Library returned an unexpected error on `GET /books/{work_key}` |\n| 503 | LLM is down (`/chat`, `/approve`, `/reject`) or the catalogue is down (`GET /books`) |\n\nFull write-up: `docs/02_fastapi_layer.md`, `docs/07_human_in_the_loop.md`, `docs/15_sessions.md`.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:8000",
+      "description": "FastAPI origin. No trailing slash."
+    },
+    {
+      "key": "session_id",
+      "value": "postman-demo",
+      "description": "Conversation id. Reuse it for every message in one chat. The Send a message test script overwrites this with the id the server echoes back."
+    },
+    {
+      "key": "action_id",
+      "value": "",
+      "description": "Set automatically when Send a message returns status awaiting_approval. Required by Approve and Reject."
+    },
+    {
+      "key": "work_key",
+      "value": "OL893414W",
+      "description": "Open Library work id. OL893414W is Dune. Comes back as work_key on search results."
+    }
+  ],
+  "item": [
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            },
+            "description": "Confirms the process is serving and shows which model and memory backend it started with.\n\nNo body. No session.\n\n### 200\n\n```json\n{\n  \"status\": \"ok\",\n  \"llm_model\": \"openai:gpt-4o-mini\",\n  \"checkpoint_backend\": \"memory\"\n}\n```\n\n`checkpoint_backend` is `memory` (lost on restart) or `sqlite` (Bonus 5, `CHECKPOINT_BACKEND=sqlite`).\n\nCall this first. If it fails, uvicorn is not running or `baseUrl` is wrong."
+          },
+          "response": [
+            {
+              "name": "200 OK",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/health",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["health"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"status\": \"ok\",\n  \"llm_model\": \"openai:gpt-4o-mini\",\n  \"checkpoint_backend\": \"memory\"\n}"
+            }
+          ]
+        }
+      ],
+      "description": "Liveness. Does not touch the agent or Open Library."
+    },
+    {
+      "name": "Conversation",
+      "item": [
+        {
+          "name": "Send a message",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('HTTP 200', function () {",
+                  "    pm.response.to.have.status(200);",
+                  "});",
+                  "",
+                  "const body = pm.response.json();",
+                  "pm.test('has status and response', function () {",
+                  "    pm.expect(body.status).to.be.oneOf(['completed', 'awaiting_approval']);",
+                  "    pm.expect(body.response).to.be.a('string').and.not.empty;",
+                  "});",
+                  "",
+                  "if (body.session_id) {",
+                  "    pm.collectionVariables.set('session_id', body.session_id);",
+                  "}",
+                  "if (body.pending_action && body.pending_action.action_id) {",
+                  "    pm.collectionVariables.set('action_id', body.pending_action.action_id);",
+                  "    console.log('Saved action_id for Approve/Reject: ' + body.pending_action.action_id);",
+                  "} else {",
+                  "    pm.collectionVariables.set('action_id', '');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Find sci-fi classics\",\n  \"session_id\": \"{{session_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/chat",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat"]
+            },
+            "description": "One user turn. The agent may call tools (search, details, authors) and then answer. This call waits until the turn finishes, which can take 10–20 seconds when tools run.\n\n### Body\n\n| Field | Required | Notes |\n|-------|----------|-------|\n| `message` | yes | 1–2000 characters. Empty string → **422**. |\n| `session_id` | no | If you omit it, the server mints one and returns it. **You must reuse that id** or the next message is a new empty conversation. This request sends `{{session_id}}`. |\n\n### What to send, in order\n\nEdit `message` and send again with the same session:\n\n1. `Find sci-fi classics` → `status: completed`, a numbered list.\n2. `Tell me more about number 2` → the agent resolves \"number 2\" from this session's history.\n3. `I want to read number 1` → `status: awaiting_approval`. Copy is unnecessary: the Tests script stores `pending_action.action_id` in `{{action_id}}`. Then run **Approve** or **Reject**.\n\n### 200 completed\n\n`pending_action` and `handoff_url` are null. Show `response`.\n\n### 200 awaiting_approval\n\nThe `proceed_to_borrow` tool has **not** run. `handoff_url` is null on purpose. Show `pending_action.description` and call `/approve` or `/reject` with `pending_action.action_id`.\n\n### Errors\n\n- **422** `Invalid message: ...` — empty or oversized `message`.\n- **503** `The AI service is temporarily unavailable.` — model key, quota, or network. The real reason is in the uvicorn log, not this body.\n\nIf you send a new message while an approval card is still pending, the server treats that as a reject and then answers the new message."
+          },
+          "response": [
+            {
+              "name": "200 completed",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"message\": \"Find sci-fi classics\",\n  \"session_id\": \"{{session_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/chat",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["chat"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"session_id\": \"postman-demo\",\n  \"status\": \"completed\",\n  \"response\": \"1. **Dune** by Frank Herbert (1965)\\n2. **Foundation** by Isaac Asimov (1951)\",\n  \"pending_action\": null,\n  \"handoff_url\": null\n}"
+            },
+            {
+              "name": "200 awaiting approval",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"message\": \"I want to read number 1\",\n  \"session_id\": \"{{session_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/chat",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["chat"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"session_id\": \"postman-demo\",\n  \"status\": \"awaiting_approval\",\n  \"response\": \"You selected:\\n  Title:  Dune\\n  Author: Frank Herbert (1965)\\n  Id:     OL893414W\\n\\nContinue to Open Library to read or borrow this book?\",\n  \"pending_action\": {\n    \"action_id\": \"b40fe10a9b34f8373bd97f2afad74bbf\",\n    \"tool_name\": \"proceed_to_borrow\",\n    \"arguments\": {\n      \"work_key\": \"OL893414W\",\n      \"title\": \"Dune\",\n      \"author\": \"Frank Herbert\",\n      \"year\": 1965\n    },\n    \"description\": \"You selected:\\n  Title:  Dune\\n  Author: Frank Herbert (1965)\\n  Id:     OL893414W\\n\\nContinue to Open Library to read or borrow this book?\"\n  },\n  \"handoff_url\": null\n}"
+            },
+            {
+              "name": "422 empty message",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"message\": \"\",\n  \"session_id\": \"postman-demo\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/chat",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["chat"]
+                }
+              },
+              "status": "Unprocessable Entity",
+              "code": 422,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Invalid message: String should have at least 1 character\"\n}"
+            },
+            {
+              "name": "503 AI unavailable",
+              "originalRequest": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/chat",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["chat"]
+                }
+              },
+              "status": "Service Unavailable",
+              "code": 503,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"The AI service is temporarily unavailable.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Send a message (stream)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "text/event-stream"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"message\": \"Find sci-fi classics\",\n  \"session_id\": \"{{session_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/chat/stream",
+              "host": ["{{baseUrl}}"],
+              "path": ["chat", "stream"]
+            },
+            "description": "Same body and same session rules as **Send a message**. The answer is a Server-Sent Events stream instead of one JSON document. The turn is still saved on `{{session_id}}`, so a later `/chat` or `GET /sessions/{{session_id}}` sees it.\n\nPostman buffers the body and shows it when the stream ends. For live frames use:\n\n```\ncurl -N -X POST {{baseUrl}}/chat/stream \\\n  -H 'content-type: application/json' \\\n  -d '{\"message\":\"Find sci-fi classics\",\"session_id\":\"{{session_id}}\"}'\n```\n\n### Frames, in order\n\n```\nevent: status\ndata: {\"type\":\"status\",\"message\":\"Searching the catalogue…\"}\n\nevent: token\ndata: {\"type\":\"token\",\"content\":\"I found\"}\n\nevent: done\ndata: {\"type\":\"done\",\"session_id\":\"postman-demo\",\"status\":\"completed\",\"response\":\"I found these books...\",\"pending_action\":null,\"handoff_url\":null}\n```\n\n1. Zero or more `status` frames while a tool runs.\n2. Zero or more `token` frames (pieces of the answer).\n3. Exactly one `done` frame. This is the same object `/chat` would have returned. Trust `done`, not the concatenated tokens, for `pending_action` and `handoff_url`.\n\nOn failure after the stream has started you get `event: error` with `{\"type\":\"error\",\"detail\":\"The AI service is temporarily unavailable.\"}` and HTTP 200, because the status code was already sent.\n\nHeaders `Cache-Control: no-cache` and `X-Accel-Buffering: no` tell proxies not to hold the stream.\n\nIf `done.status` is `awaiting_approval`, run **Approve** or **Reject** with `done.pending_action.action_id`. This request does not auto-save `action_id` (the body is not a single JSON object)."
+          },
+          "response": [
+            {
+              "name": "200 event stream",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Accept",
+                    "value": "text/event-stream"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"message\": \"Find sci-fi classics\",\n  \"session_id\": \"{{session_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/chat/stream",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["chat", "stream"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "text",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "text/event-stream"
+                }
+              ],
+              "body": "event: status\ndata: {\"type\": \"status\", \"message\": \"Searching the catalogue…\"}\n\nevent: token\ndata: {\"type\": \"token\", \"content\": \"I found \"}\n\nevent: token\ndata: {\"type\": \"token\", \"content\": \"Dune and Foundation.\"}\n\nevent: done\ndata: {\"type\": \"done\", \"session_id\": \"postman-demo\", \"status\": \"completed\", \"response\": \"I found Dune and Foundation.\", \"pending_action\": null, \"handoff_url\": null}\n\n"
+            }
+          ]
+        }
+      ],
+      "description": "Talk to the agent. Both routes take the same JSON body. `/chat` returns one object. `/chat/stream` returns Server-Sent Events."
+    },
+    {
+      "name": "Human in the loop",
+      "item": [
+        {
+          "name": "Approve pending action",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "pm.test('not an error status', function () {",
+                  "    pm.expect(pm.response.code).to.be.oneOf([200, 409, 503]);",
+                  "});",
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    pm.test('approval finished', function () {",
+                  "        pm.expect(body.status).to.eql('completed');",
+                  "        pm.expect(body.handoff_url).to.be.a('string').and.not.empty;",
+                  "    });",
+                  "    pm.collectionVariables.set('action_id', '');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"action_id\": \"{{action_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/approve",
+              "host": ["{{baseUrl}}"],
+              "path": ["approve"]
+            },
+            "description": "Run the paused `proceed_to_borrow` tool and let the agent finish its reply.\n\nOnly call this after **Send a message** returned `status: awaiting_approval`. `{{action_id}}` is filled by that request's Tests script. If you skipped it, paste `pending_action.action_id` into the collection variable `action_id` (or into this body).\n\n### Body\n\n| Field | Required | Notes |\n|-------|----------|-------|\n| `session_id` | yes | The conversation that is paused. |\n| `action_id` | yes | Must match the live interrupt. A wrong or old id → **409**. |\n\n### 200\n\n`status` is `completed`. `handoff_url` is the Open Library page, for example `https://openlibrary.org/works/OL893414W`. `response` tells the user to continue there. The app does not borrow the book.\n\n### Errors\n\n- **409** `There is no action awaiting approval in this session.` — nothing is paused (already approved, rejected, or never asked).\n- **409** `That action is no longer pending...` — `action_id` does not match the current pause.\n- **422** — `session_id` or `action_id` missing.\n- **503** — the model failed while resuming. The tool may already have run; check the uvicorn log before retrying."
+          },
+          "response": [
+            {
+              "name": "200 approved",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"action_id\": \"{{action_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/approve",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["approve"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"session_id\": \"postman-demo\",\n  \"status\": \"completed\",\n  \"response\": \"You approved this book. Continue on Open Library to read or borrow it: https://openlibrary.org/works/OL893414W\",\n  \"pending_action\": null,\n  \"handoff_url\": \"https://openlibrary.org/works/OL893414W\"\n}"
+            },
+            {
+              "name": "409 nothing pending",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"action_id\": \"{{action_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/approve",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["approve"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"There is no action awaiting approval in this session.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Reject pending action",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    pm.test('rejected with no URL', function () {",
+                  "        pm.expect(body.status).to.eql('completed');",
+                  "        pm.expect(body.handoff_url).to.eql(null);",
+                  "    });",
+                  "    pm.collectionVariables.set('action_id', '');",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"action_id\": \"{{action_id}}\"\n}",
+              "options": {
+                "raw": {
+                  "language": "json"
+                }
+              }
+            },
+            "url": {
+              "raw": "{{baseUrl}}/reject",
+              "host": ["{{baseUrl}}"],
+              "path": ["reject"]
+            },
+            "description": "Cancel the paused hand-off. The tool does **not** run, so there is no Open Library URL.\n\nSame body as **Approve**: `session_id` plus the `action_id` from `pending_action`. Use one or the other, not both, for a given pause.\n\n### 200\n\n`status` is `completed`. `handoff_url` is null. `response` is the agent acknowledging the cancellation and offering to keep browsing.\n\n### Errors\n\nSame as Approve: **409** if nothing is pending or `action_id` is stale, **422** if a field is missing, **503** if the model fails while writing the acknowledgement."
+          },
+          "response": [
+            {
+              "name": "200 rejected",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"session_id\": \"{{session_id}}\",\n  \"action_id\": \"{{action_id}}\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/reject",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["reject"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"session_id\": \"postman-demo\",\n  \"status\": \"completed\",\n  \"response\": \"No problem — I won't continue to Open Library. Want to keep browsing?\",\n  \"pending_action\": null,\n  \"handoff_url\": null\n}"
+            },
+            {
+              "name": "409 stale action id",
+              "originalRequest": {
+                "method": "POST",
+                "header": [
+                  {
+                    "key": "Content-Type",
+                    "value": "application/json"
+                  }
+                ],
+                "body": {
+                  "mode": "raw",
+                  "raw": "{\n  \"session_id\": \"postman-demo\",\n  \"action_id\": \"stale-id\"\n}"
+                },
+                "url": {
+                  "raw": "{{baseUrl}}/reject",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["reject"]
+                }
+              },
+              "status": "Conflict",
+              "code": 409,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"That action is no longer pending. Please refresh the conversation.\"\n}"
+            }
+          ]
+        }
+      ],
+      "description": "Run these only while a session is paused (`status: awaiting_approval`). Approve reveals `handoff_url`. Reject does not."
+    },
+    {
+      "name": "Sessions",
+      "item": [
+        {
+          "name": "Get session",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{session_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{session_id}}"]
+            },
+            "description": "Read the transcript stored for this conversation. Does not call the model.\n\nPath parameter `session_id` is the collection variable, so it matches whatever **Send a message** last saved.\n\n### 200\n\n```json\n{\n  \"session_id\": \"postman-demo\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Find sci-fi classics\"},\n    {\"role\": \"assistant\", \"content\": \"1. **Dune** by Frank Herbert (1965)\"}\n  ],\n  \"has_pending_action\": false\n}\n```\n\n`messages` is only user and assistant text. Tool calls and raw JSON stay inside the checkpoint; they are not in this payload. `has_pending_action` is true while Approve/Reject is still outstanding.\n\n### 404\n\n`Unknown session '...'` — this id was never used, or it was deleted. With `CHECKPOINT_BACKEND=memory`, restarting uvicorn also drops every session."
+          },
+          "response": [
+            {
+              "name": "200 history",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/sessions/{{session_id}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["sessions", "{{session_id}}"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"session_id\": \"postman-demo\",\n  \"messages\": [\n    {\"role\": \"user\", \"content\": \"Find sci-fi classics\"},\n    {\"role\": \"assistant\", \"content\": \"1. **Dune** by Frank Herbert (1965)\\n2. **Foundation** by Isaac Asimov (1951)\"}\n  ],\n  \"has_pending_action\": false\n}"
+            },
+            {
+              "name": "404 unknown session",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/sessions/nope",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["sessions", "nope"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Unknown session 'nope'.\"\n}"
+            }
+          ]
+        },
+        {
+          "name": "Delete session",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/sessions/{{session_id}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["sessions", "{{session_id}}"]
+            },
+            "description": "Delete this conversation from the checkpointer (memory or sqlite). The next `GET /sessions/{{session_id}}` is **404**, and a new `/chat` with the same id starts from an empty history.\n\nNo body. **204** has an empty body on success.\n\n**404** if the id was never used or was already deleted.\n\nThe Streamlit **New conversation** button calls this, then generates a fresh id."
+          },
+          "response": [
+            {
+              "name": "204 deleted",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/sessions/{{session_id}}",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["sessions", "{{session_id}}"]
+                }
+              },
+              "status": "No Content",
+              "code": 204,
+              "_postman_previewlanguage": "text",
+              "header": [],
+              "body": ""
+            },
+            {
+              "name": "404 unknown session",
+              "originalRequest": {
+                "method": "DELETE",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/sessions/nope",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["sessions", "nope"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"Unknown session 'nope'.\"\n}"
+            }
+          ]
+        }
+      ],
+      "description": "Inspect or wipe one conversation. The id in the path is the same `session_id` you send to `/chat`."
+    },
+    {
+      "name": "Books",
+      "item": [
+        {
+          "name": "Get book details",
+          "request": {
+            "method": "GET",
+            "header": [
+              {
+                "key": "Accept",
+                "value": "application/json"
+              }
+            ],
+            "url": {
+              "raw": "{{baseUrl}}/books/{{work_key}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["books", "{{work_key}}"]
+            },
+            "description": "Fetch one book from Open Library **without** the agent. Useful for a details card in a UI, and for checking that the service layer works when you do not want to spend an LLM call.\n\nPath parameter `work_key` defaults to `OL893414W` (Dune). A search tool result's `work_key` is the value to put here. A leading `/works/` is stripped server-side; `OL893414W` is enough.\n\nNo session. Needs network access to `openlibrary.org`. Behind a corporate proxy, set `USE_SYSTEM_CERTS=true` or this returns **503**.\n\n### 200\n\n```json\n{\n  \"work_key\": \"OL893414W\",\n  \"title\": \"Dune\",\n  \"authors\": [\"Frank Herbert\"],\n  \"description\": \"Set on the desert planet Arrakis...\",\n  \"subjects\": [\"Science fiction\"],\n  \"first_publish_date\": \"1965\",\n  \"cover_url\": \"https://covers.openlibrary.org/b/id/...-L.jpg\",\n  \"url\": \"https://openlibrary.org/works/OL893414W\"\n}\n```\n\n### Errors\n\n- **400** — the id is not shaped like an Open Library work id (`OL`…`W`).\n- **404** — well-formed id, but Open Library has no such work (`I couldn't find anything matching that id.`).\n- **503** — catalogue timeout or connection failure (`The book catalogue service is temporarily unavailable...`)."
+          },
+          "response": [
+            {
+              "name": "200 Dune",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/books/OL893414W",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["books", "OL893414W"]
+                }
+              },
+              "status": "OK",
+              "code": 200,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"work_key\": \"OL893414W\",\n  \"title\": \"Dune\",\n  \"authors\": [\"Frank Herbert\"],\n  \"description\": \"Set on the desert planet Arrakis, Dune is the story of the boy Paul Atreides...\",\n  \"subjects\": [\"Science fiction\", \"Fiction\"],\n  \"first_publish_date\": \"1965\",\n  \"cover_url\": \"https://covers.openlibrary.org/b/id/11481354-L.jpg\",\n  \"url\": \"https://openlibrary.org/works/OL893414W\"\n}"
+            },
+            {
+              "name": "400 bad work key",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/books/not-a-key",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["books", "not-a-key"]
+                }
+              },
+              "status": "Bad Request",
+              "code": 400,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"'not-a-key' is not a valid work id (expected e.g. OL893414W).\"\n}"
+            },
+            {
+              "name": "404 unknown work",
+              "originalRequest": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                  "raw": "{{baseUrl}}/books/OL0000000W",
+                  "host": ["{{baseUrl}}"],
+                  "path": ["books", "OL0000000W"]
+                }
+              },
+              "status": "Not Found",
+              "code": 404,
+              "_postman_previewlanguage": "json",
+              "header": [
+                {
+                  "key": "Content-Type",
+                  "value": "application/json"
+                }
+              ],
+              "body": "{\n  \"detail\": \"I couldn't find anything matching that id.\"\n}"
+            }
+          ]
+        }
+      ],
+      "description": "Direct catalogue lookup. Bypasses the LLM. In the Ticketmaster assignment this is `GET /events/{event_id}`."
+    }
+  ]
+}

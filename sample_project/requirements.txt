@@ -1,0 +1,39 @@
+# ---------------------------------------------------------------------------
+# Web layer (FastAPI backend)
+# ---------------------------------------------------------------------------
+fastapi>=0.115
+uvicorn[standard]>=0.30
+pydantic>=2.7
+pydantic-settings>=2.3
+python-dotenv>=1.0
+
+# ---------------------------------------------------------------------------
+# Agent layer (LangChain 1.x is built on top of LangGraph)
+# ---------------------------------------------------------------------------
+langchain>=1.0
+langgraph>=1.0
+langchain-openai>=1.0          # swap/add: langchain-anthropic, langchain-google-genai, ...
+grandalf>=0.8                  # optional ASCII graph dump at startup (draw_ascii)
+
+# Persistent conversation memory across backend restarts (Bonus 5).
+# Only used when CHECKPOINT_BACKEND=sqlite in .env
+langgraph-checkpoint-sqlite>=2.0
+
+# ---------------------------------------------------------------------------
+# HTTP client used by the service layer to call the external API
+# ---------------------------------------------------------------------------
+httpx>=0.27
+# Optional - trust the OS certificate store (needed behind corporate proxies such as Zscaler).
+# Enable with USE_SYSTEM_CERTS=true in .env
+truststore>=0.9
+
+# ---------------------------------------------------------------------------
+# Frontend (Streamlit talks to FastAPI over HTTP)
+# ---------------------------------------------------------------------------
+streamlit>=1.36
+requests>=2.32
+
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
+pytest>=8.0
